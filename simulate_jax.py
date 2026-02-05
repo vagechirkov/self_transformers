@@ -17,6 +17,13 @@ from datetime import datetime
 from pathlib import Path
 import pickle
 
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # Enable 64-bit precision if needed
 # jax.config.update("jax_enable_x64", True)
 
@@ -62,7 +69,8 @@ class Config:
     max_instructions: int = 20     # Maximum instruction definitions
     max_ops_per_instr: int = 10    # Maximum ops per instruction
     max_code_len: int = 50         # Maximum code section length
-    pop_size: int = 1000           # Population size
+    pop_size: int = 1000           # Maximum population size (capacity)
+    initial_pop: int = 10          # Initial population count
     cpu_cycles: int = 500          # CPU cycles per organism per epoch
     max_age: int = 80              # Maximum age before death
     
@@ -182,10 +190,11 @@ def parse_genome(genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
                 valid_op = ~is_marker & ~at_end & (op_idx < cfg.max_ops_per_instr)
                 ops_row = jnp.where(valid_op, ops_row.at[op_idx].set(gene), ops_row)
                 
-                # Read args
+                # Read args (only for ops that have args)
                 arg0_ptr = ptr + 1
                 arg1_ptr = ptr + 2
-                arg0 = jnp.where((arg0_ptr < genome_len) & valid_op, genome[arg0_ptr], 0)
+                has_args = is_1arg | is_2arg
+                arg0 = jnp.where((arg0_ptr < genome_len) & valid_op & has_args, genome[arg0_ptr], 0)
                 arg1 = jnp.where((arg1_ptr < genome_len) & valid_op & is_2arg, genome[arg1_ptr], 0)
                 
                 args_row = jnp.where(valid_op, args_row.at[op_idx, 0].set(arg0), args_row)
@@ -525,7 +534,10 @@ def init_population(key: jax.Array, cfg: Config):
     
     # Vectorized init
     def init_one(i):
-        return init_organism(ancestor_genome, ancestor_len, cfg)
+        state = init_organism(ancestor_genome, ancestor_len, cfg)
+        # Only first initial_pop organisms are alive
+        state['alive'] = i < cfg.initial_pop
+        return state
     
     # Stack all organisms
     pop = jax.vmap(init_one)(jnp.arange(cfg.pop_size))
@@ -536,9 +548,9 @@ def init_population(key: jax.Array, cfg: Config):
 # 8. EPOCH STEP
 # ==========================================
 
-def epoch_step(carry, key):
+def epoch_step(cfg, carry, key):
     """Run one epoch of the simulation."""
-    pop, cfg = carry
+    pop = carry
     k1, k2, k3 = random.split(key, 3)
     
     # Run all organisms in parallel
@@ -577,44 +589,46 @@ def epoch_step(carry, key):
     pop['alive'] = pop['alive'] & ~too_old
     n_aged_deaths = jnp.sum(too_old & pop['alive'])
     
-    # Replace dead organisms with children
-    # Simple strategy: find dead slots, fill with children
+    # Place children in empty (not alive) slots
     alive_mask = pop['alive']
-    dead_indices = jnp.where(~alive_mask, jnp.arange(cfg.pop_size), cfg.pop_size)
+    
+    # Get indices of empty slots and children
+    empty_indices = jnp.where(~alive_mask, jnp.arange(cfg.pop_size), cfg.pop_size)
     child_indices = jnp.where(has_child, jnp.arange(cfg.pop_size), cfg.pop_size)
     
     # Sort to get valid indices first
-    dead_indices = jnp.sort(dead_indices)
+    empty_indices = jnp.sort(empty_indices)
     child_indices = jnp.sort(child_indices)
     
-    # Match children to dead slots
+    # Match children to empty slots
     def assign_children(carry, i):
-        pop, child_genomes, child_lens, dead_idx_ptr, child_idx_ptr = carry
+        pop, child_genomes, child_lens, slot_idx_ptr, child_idx_ptr = carry
         
-        dead_slot = dead_indices[dead_idx_ptr]
+        slot = empty_indices[slot_idx_ptr]  # Next empty slot
         child_src = child_indices[child_idx_ptr]
         
-        valid = (dead_slot < cfg.pop_size) & (child_src < cfg.pop_size)
+        # Valid if we have both an empty slot and a child
+        valid = (slot < cfg.pop_size) & (child_src < cfg.pop_size)
         
         # Initialize child organism in dead slot
         def do_assign(args):
             pop, slot, genome, length = args
             new_state = init_organism(genome, length, cfg)
             # Update pop arrays at slot
-            pop = jax.tree_map(lambda p, n: p.at[slot].set(n), pop, new_state)
+            pop = jax.tree.map(lambda p, n: p.at[slot].set(n), pop, new_state)
             return pop
         
         pop = lax.cond(
             valid,
             do_assign,
             lambda args: args[0],
-            (pop, dead_slot, mutated_genomes[child_src], mutated_lens[child_src])
+            (pop, slot, mutated_genomes[child_src], mutated_lens[child_src])
         )
         
-        dead_idx_ptr = jnp.where(valid, dead_idx_ptr + 1, dead_idx_ptr)
+        slot_idx_ptr = jnp.where(valid, slot_idx_ptr + 1, slot_idx_ptr)
         child_idx_ptr = jnp.where(valid, child_idx_ptr + 1, child_idx_ptr)
         
-        return (pop, child_genomes, child_lens, dead_idx_ptr, child_idx_ptr), None
+        return (pop, child_genomes, child_lens, slot_idx_ptr, child_idx_ptr), None
     
     (pop, _, _, _, _), _ = lax.scan(
         assign_children,
@@ -636,18 +650,39 @@ def epoch_step(carry, key):
         'avg_genome_len': avg_genome_len,
     }
     
-    return (pop, cfg), stats
+    return pop, stats
 
 
 # ==========================================
 # 9. MAIN SIMULATION
 # ==========================================
 
-def run_simulation(key: jax.Array, cfg: Config, epochs: int):
+def run_simulation(key: jax.Array, cfg: Config, epochs: int, use_wandb: bool = False):
     """Run the full simulation."""
     print(f"=== JAX PHYSIS SIMULATION ===")
-    print(f"Population: {cfg.pop_size}, Epochs: {epochs}, CPU cycles: {cfg.cpu_cycles}")
+    print(f"Population: {cfg.pop_size}, Initial: {cfg.initial_pop}, Epochs: {epochs}, CPU cycles: {cfg.cpu_cycles}")
     print()
+    
+    # Initialize wandb if requested
+    if use_wandb:
+        if not WANDB_AVAILABLE:
+            print("WARNING: wandb not installed. Run: pip install wandb")
+            use_wandb = False
+        else:
+            wandb.init(
+                project="physis-jax",
+                config={
+                    "epochs": epochs,
+                    "pop_size": cfg.pop_size,
+                    "initial_pop": cfg.initial_pop,
+                    "cpu_cycles": cfg.cpu_cycles,
+                    "max_genome_len": cfg.max_genome_len,
+                    "max_age": cfg.max_age,
+                    "point_mutation_rate": cfg.point_mutation_rate,
+                    "indel_rate": cfg.indel_rate,
+                }
+            )
+            print(f"Logging to wandb project: physis-jax")
     
     # Initialize
     k1, k2 = random.split(key)
@@ -664,15 +699,29 @@ def run_simulation(key: jax.Array, cfg: Config, epochs: int):
     
     for chunk in range(n_chunks):
         chunk_keys = epoch_keys[chunk * chunk_size:(chunk + 1) * chunk_size]
-        (pop, cfg), stats = lax.scan(epoch_step, (pop, cfg), chunk_keys)
+        pop, stats = lax.scan(partial(epoch_step, cfg), pop, chunk_keys)
         
         # Log last stats of chunk
         epoch_num = (chunk + 1) * chunk_size
-        print(f"Epoch {epoch_num}: Pop={int(stats['pop_size'][-1])}, "
-              f"Births={int(stats['births'][-1])}, "
-              f"AvgLen={float(stats['avg_genome_len'][-1]):.1f}")
+        pop_size = int(stats['pop_size'][-1])
+        births = int(stats['births'][-1])
+        avg_len = float(stats['avg_genome_len'][-1])
         
-        all_stats.append(jax.tree_map(lambda x: np.array(x), stats))
+        print(f"Epoch {epoch_num}: Pop={pop_size}, "
+              f"Births={births}, "
+              f"AvgLen={avg_len:.1f}")
+        
+        # Log to wandb
+        if use_wandb:
+            for i in range(chunk_size):
+                wandb.log({
+                    "epoch": chunk * chunk_size + i,
+                    "population/size": int(stats['pop_size'][i]),
+                    "population/births": int(stats['births'][i]),
+                    "genome/avg_len": float(stats['avg_genome_len'][i]),
+                })
+        
+        all_stats.append(jax.tree.map(lambda x: np.array(x), stats))
     
     return pop, all_stats
 
@@ -685,16 +734,19 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Physis JAX - Parallel Digital Evolution')
-    parser.add_argument('--epochs', type=int, default=1000, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs')
     parser.add_argument('--pop-size', type=int, default=1000, help='Population size')
+    parser.add_argument('--initial-pop', type=int, default=10, help='Initial population')
     parser.add_argument('--cpu-cycles', type=int, default=500, help='CPU cycles per organism')
     parser.add_argument('--max-genome', type=int, default=100, help='Max genome length')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
     
     args = parser.parse_args()
     
     cfg = make_config(
         pop_size=args.pop_size,
+        initial_pop=args.initial_pop,
         cpu_cycles=args.cpu_cycles,
         max_genome_len=args.max_genome,
     )
@@ -708,7 +760,7 @@ if __name__ == "__main__":
     # Run
     import time
     start = time.time()
-    pop, stats = run_simulation(key, cfg, args.epochs)
+    pop, stats = run_simulation(key, cfg, args.epochs, use_wandb=args.wandb)
     elapsed = time.time() - start
     
     print(f"\nCompleted in {elapsed:.2f}s")
